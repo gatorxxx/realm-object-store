@@ -109,8 +109,11 @@ void RealmCoordinator::create_sync_session(bool force_client_resync)
     SyncSession::Internal::set_sync_transact_callback(*m_sync_session,
                                                       [weak_self](VersionID old_version, VersionID new_version) {
         if (auto self = weak_self.lock()) {
-            if (self->m_transaction_callback)
-                self->m_transaction_callback(old_version, new_version);
+            std::unique_lock<std::mutex> lock(self->m_transaction_callback_mutex);
+            if (auto transaction_callback = self->m_transaction_callback) {
+                lock.unlock();
+                transaction_callback(old_version, new_version);
+            }
             if (self->m_notifier)
                 self->m_notifier->notify_others();
         }
@@ -1125,6 +1128,7 @@ void RealmCoordinator::process_available_async(Realm& realm)
 void RealmCoordinator::set_transaction_callback(std::function<void(VersionID, VersionID)> fn)
 {
     create_sync_session(false);
+    std::lock_guard<std::mutex> lock(m_transaction_callback_mutex);
     m_transaction_callback = std::move(fn);
 }
 
