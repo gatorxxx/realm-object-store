@@ -162,12 +162,31 @@ public:
         size_t valid_count;
     };
 
+    // The
+    struct InvalidEmbeddedOperationException : public std::logic_error {
+        InvalidEmbeddedOperationException(const char *msg) : std::logic_error(msg) { }
+
+        static InvalidEmbeddedOperationException add()
+        {
+            return "Adding an existing managed embedded object to a List is not supported.";
+        }
+        static InvalidEmbeddedOperationException insert()
+        {
+            return "Inserting an existing managed embedded object into a List is not supported.";
+        }
+        static InvalidEmbeddedOperationException set()
+        {
+            return "Setting a List entry to an an existing managed embedded object is not supported.";
+        }
+    };
+
 private:
     std::shared_ptr<Realm> m_realm;
     PropertyType m_type;
     mutable util::CopyableAtomic<const ObjectSchema*> m_object_schema = nullptr;
     _impl::CollectionNotifier::Handle<_impl::ListNotifier> m_notifier;
     std::shared_ptr<LstBase> m_list_base;
+    bool m_is_embedded = false;
 
     void verify_valid_row(size_t row_ndx, bool insertion = false) const;
     void validate(const Obj&) const;
@@ -217,64 +236,74 @@ size_t List::find(Context& ctx, T&& value) const
 template<typename T, typename Context>
 void List::add(Context& ctx, T&& value, CreatePolicy policy)
 {
+    if (m_is_embedded) {
+        if (ctx.template unbox<Obj>(value, CreatePolicy::Skip).is_valid())
+            throw InvalidEmbeddedOperationException::add();
+        auto key = as<Obj>().create_and_insert_linked_object(size()).get_key();
+        Object::create(ctx, m_realm, get_object_schema(), std::forward<T>(value),
+                       CreatePolicy::UpdateAll, key);
+        return;
+    }
     dispatch([&](auto t) { this->add(ctx.template unbox<std::decay_t<decltype(*t)>>(value, policy)); });
 }
 
 template<typename T, typename Context>
 void List::insert(Context& ctx, size_t list_ndx, T&& value, CreatePolicy policy)
 {
+    if (m_is_embedded) {
+        if (ctx.template unbox<Obj>(value, CreatePolicy::Skip).is_valid())
+            throw InvalidEmbeddedOperationException::insert();
+        auto key = as<Obj>().create_and_insert_linked_object(list_ndx).get_key();
+        Object::create(ctx, m_realm, get_object_schema(), std::forward<T>(value),
+                       CreatePolicy::UpdateAll, key);
+        return;
+    }
     dispatch([&](auto t) { this->insert(list_ndx, ctx.template unbox<std::decay_t<decltype(*t)>>(value, policy)); });
 }
 
 template<typename T, typename Context>
-void List::set(Context& ctx, size_t row_ndx, T&& value, CreatePolicy policy)
+void List::set(Context& ctx, size_t list_ndx, T&& value, CreatePolicy policy)
 {
-    dispatch([&](auto t) { this->set(row_ndx, ctx.template unbox<std::decay_t<decltype(*t)>>(value, policy)); });
-}
+    if (m_is_embedded) {
+        if (ctx.template unbox<Obj>(value, CreatePolicy::Skip).is_valid())
+            throw InvalidEmbeddedOperationException::set();
 
-namespace _impl {
-template <class T>
-inline ObjKey help_get_current_row(const T&)
-{
-    return ObjKey();
-}
-
-template <>
-inline ObjKey help_get_current_row(const ConstObj& v)
-{
-    return v.get_key();
-}
-
-template <>
-inline ObjKey help_get_current_row(const Obj& v)
-{
-    return v.get_key();
-}
-
-template <class T>
-inline bool help_compare_values(const T& v1, const T& v2)
-{
-    return v1 != v2;
-}
-template <>
-inline bool help_compare_values(const Obj& v1, const Obj& v2)
-{
-    return v1.get_table() != v2.get_table() || v1.get_key() != v2.get_key();
-}
+        auto& list = as<Obj>();
+        auto key = policy == CreatePolicy::UpdateModified
+                 ? list.get(list_ndx) : list.create_and_set_linked_object(list_ndx).get_key();
+        Object::create(ctx, m_realm, get_object_schema(), std::forward<T>(value), policy, key);
+        return;
+    }
+    dispatch([&](auto t) { this->set(list_ndx, ctx.template unbox<std::decay_t<decltype(*t)>>(value, policy)); });
 }
 
 template<typename T, typename Context>
 void List::set_if_different(Context& ctx, size_t row_ndx, T&& value, CreatePolicy policy)
 {
+    if (m_is_embedded) {
+        if (ctx.template unbox<Obj>(value, CreatePolicy::Skip).is_valid())
+            throw InvalidEmbeddedOperationException::set();
+        auto key = policy == CreatePolicy::UpdateModified
+                 ? this->get<Obj>(row_ndx) : as<Obj>().create_and_set_linked_object(row_ndx);
+        ctx.template unbox<Obj>(value, policy, key.get_key());
+        return;
+    }
     dispatch([&](auto t) {
         using U = std::decay_t<decltype(*t)>;
-        auto old_value =  this->get<U>(row_ndx);
-        auto new_value = ctx.template unbox<U>(value, policy, _impl::help_get_current_row(old_value));
-        if (_impl::help_compare_values(old_value, new_value))
-            this->set(row_ndx, new_value);
+        if constexpr (std::is_same_v<U, Obj>) {
+            auto old_value =  this->get<U>(row_ndx);
+            auto new_value = ctx.template unbox<U>(value, policy, old_value.get_key());
+            if (new_value.get_key() != old_value.get_key())
+                this->set(row_ndx, new_value);
+        }
+        else {
+            auto old_value =  this->get<U>(row_ndx);
+            auto new_value = ctx.template unbox<U>(value, policy);
+            if (old_value != new_value)
+                this->set(row_ndx, new_value);
+        }
     });
 }
-
 
 template<typename T, typename Context>
 void List::assign(Context& ctx, T&& values, CreatePolicy policy)
@@ -287,28 +316,23 @@ void List::assign(Context& ctx, T&& values, CreatePolicy policy)
         return;
     }
 
-    if (policy == CreatePolicy::UpdateModified) {
-        size_t sz = size();
-        size_t index = 0;
-        ctx.enumerate_list(values, [&](auto&& element) {
-            if (index < sz) {
-                this->set_if_different(ctx, index, element, policy);
-            }
-            else {
-                this->add(ctx, element, policy);
-            }
-            index++;
-        });
-        while (index < sz) {
-            remove(--sz);
-        }
-    }
-    else {
+
+    if (policy != CreatePolicy::UpdateModified)
         remove_all();
-        ctx.enumerate_list(values, [&](auto&& element) {
+
+    size_t sz = size();
+    size_t index = 0;
+    ctx.enumerate_list(values, [&](auto&& element) {
+        if (index >= sz)
             this->add(ctx, element, policy);
-        });
-    }
+        else if (policy == CreatePolicy::UpdateModified)
+            this->set_if_different(ctx, index, element, policy);
+        else
+            this->set(ctx, index, element, policy);
+        index++;
+    });
+    while (index < sz)
+        remove(--sz);
 }
 } // namespace realm
 
